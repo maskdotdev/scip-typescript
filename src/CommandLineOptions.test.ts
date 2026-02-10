@@ -37,5 +37,6 @@ checkIndexParser(['--infer-tsconfig'], { inferTsconfig: true })
 checkIndexParser(['--no-progress-bar'], { progressBar: false })
 checkIndexParser(['--progress-bar'], { progressBar: true })
 checkIndexParser(['--no-global-caches'], { globalCaches: false })
+checkIndexParser(['--incremental'], { incremental: true })
 
 test.run()

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import * as child_process from 'child_process'
+import { createHash } from 'crypto'
 import * as fs from 'fs'
 import { EOL } from 'os'
 import * as path from 'path'
@@ -15,6 +16,7 @@ import {
   MultiProjectOptions,
   ProjectOptions,
 } from './CommandLineOptions'
+import { computeAffectedFiles } from './Incremental'
 import { inferTsconfig } from './inferTsconfig'
 import { ProjectIndexer } from './ProjectIndexer'
 import * as scip from './scip'
@@ -41,6 +43,9 @@ export function indexCommand(
   }
   options.cwd = makeAbsolutePath(process.cwd(), options.cwd)
   options.output = makeAbsolutePath(options.cwd, options.output)
+  if (options.incremental) {
+    options.incrementalRoot = `${options.output}.incremental`
+  }
   if (!options.indexedProjects) {
     options.indexedProjects = new Set()
   }
@@ -150,8 +155,248 @@ function indexSingleProject(options: ProjectOptions, cache: GlobalCache): void {
   }
 
   if (config.fileNames.length > 0) {
-    new ProjectIndexer(config, options, cache).index()
+    const indexer = new ProjectIndexer(config, options, cache)
+    if (!options.incremental) {
+      indexer.index()
+      return
+    }
+    indexSingleProjectIncremental(options, indexer, tsconfigFileName)
   }
+}
+
+interface IncrementalCachedFileState {
+  hash: string
+  dependents: string[]
+  blob?: string
+}
+
+interface IncrementalManifest {
+  schemaVersion: number
+  contextHash: string
+  files: Record<string, IncrementalCachedFileState>
+}
+
+interface IncrementalPaths {
+  projectDirectory: string
+  blobsDirectory: string
+  manifestPath: string
+}
+
+const INCREMENTAL_SCHEMA_VERSION = 1
+
+function indexSingleProjectIncremental(
+  options: ProjectOptions,
+  indexer: ProjectIndexer,
+  tsconfigFileName?: string
+): void {
+  const paths = incrementalPaths(options)
+  fs.mkdirSync(paths.blobsDirectory, { recursive: true })
+  const previousManifest = loadIncrementalManifest(paths.manifestPath)
+  const currentFiles = indexer.getIndexableFileNames()
+  const currentHashes = new Map<string, string>()
+  for (const fileName of currentFiles) {
+    currentHashes.set(fileName, hashFile(fileName))
+  }
+  const currentDependents = indexer.computeDependents()
+
+  const previousHashes = new Map<string, string>()
+  const previousDependents = new Map<string, Set<string>>()
+  for (const [fileName, state] of Object.entries(previousManifest.files)) {
+    previousHashes.set(fileName, state.hash)
+    previousDependents.set(fileName, new Set(state.dependents))
+  }
+  const contextHash = computeIncrementalContextHash(
+    options,
+    indexer.config,
+    tsconfigFileName
+  )
+  const computed = computeAffectedFiles({
+    currentFiles,
+    currentHashes,
+    currentDependents,
+    previousHashes,
+    previousDependents,
+    contextMatches: previousManifest.contextHash === contextHash,
+  })
+  const affected = new Set(computed.affected)
+  const unchanged = new Set(computed.unchanged)
+  for (const fileName of [...unchanged]) {
+    const previous = previousManifest.files[fileName]
+    if (!previous?.blob) {
+      continue
+    }
+    const blobPath = path.join(paths.projectDirectory, previous.blob)
+    if (!fs.existsSync(blobPath)) {
+      unchanged.delete(fileName)
+      affected.add(fileName)
+    }
+  }
+
+  const freshDocuments = new Map<string, Uint8Array>()
+  indexer.index(affected, (fileName, indexBytes) => {
+    freshDocuments.set(fileName, indexBytes)
+    options.writeIndex(scip.scip.Index.deserializeBinary(indexBytes))
+  })
+
+  const nextManifest: IncrementalManifest = {
+    schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+    contextHash,
+    files: {},
+  }
+  const usedBlobPaths = new Set<string>()
+  for (const fileName of currentFiles) {
+    const hash = currentHashes.get(fileName)
+    if (hash === undefined) {
+      continue
+    }
+    const dependents = [...(currentDependents.get(fileName) || [])].sort()
+    const fresh = freshDocuments.get(fileName)
+    if (fresh) {
+      const blob = writeBlob(paths.blobsDirectory, fresh)
+      nextManifest.files[fileName] = {
+        hash,
+        blob: path.relative(paths.projectDirectory, blob),
+        dependents,
+      }
+      usedBlobPaths.add(path.relative(paths.projectDirectory, blob))
+      continue
+    }
+
+    const previous = previousManifest.files[fileName]
+    if (previous?.blob && unchanged.has(fileName)) {
+      const blobPath = path.join(paths.projectDirectory, previous.blob)
+      const bytes = fs.readFileSync(blobPath)
+      options.writeIndex(scip.scip.Index.deserializeBinary(bytes))
+      nextManifest.files[fileName] = {
+        hash,
+        blob: previous.blob,
+        dependents,
+      }
+      usedBlobPaths.add(previous.blob)
+      continue
+    }
+
+    nextManifest.files[fileName] = {
+      hash,
+      dependents,
+    }
+  }
+
+  fs.mkdirSync(paths.projectDirectory, { recursive: true })
+  fs.writeFileSync(paths.manifestPath, JSON.stringify(nextManifest, null, 2))
+  cleanupUnusedBlobs(paths, usedBlobPaths)
+}
+
+function incrementalPaths(options: ProjectOptions): IncrementalPaths {
+  const root = options.incrementalRoot || `${options.output}.incremental`
+  const key = createHash('sha1')
+    .update(path.resolve(options.projectRoot))
+    .digest('hex')
+  const projectDirectory = path.join(root, key)
+  return {
+    projectDirectory,
+    blobsDirectory: path.join(projectDirectory, 'blobs'),
+    manifestPath: path.join(projectDirectory, 'manifest.json'),
+  }
+}
+
+function loadIncrementalManifest(manifestPath: string): IncrementalManifest {
+  if (!fs.existsSync(manifestPath)) {
+    return {
+      schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+      contextHash: '',
+      files: {},
+    }
+  }
+  const json = fs.readFileSync(manifestPath, 'utf-8')
+  const parsed = JSON.parse(json) as IncrementalManifest
+  if (parsed.schemaVersion !== INCREMENTAL_SCHEMA_VERSION) {
+    return {
+      schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+      contextHash: '',
+      files: {},
+    }
+  }
+  return parsed
+}
+
+function cleanupUnusedBlobs(paths: IncrementalPaths, usedBlobPaths: Set<string>): void {
+  if (!fs.existsSync(paths.blobsDirectory)) {
+    return
+  }
+  for (const entry of fs.readdirSync(paths.blobsDirectory)) {
+    const absolute = path.join(paths.blobsDirectory, entry)
+    const relative = path.relative(paths.projectDirectory, absolute)
+    if (!usedBlobPaths.has(relative)) {
+      fs.rmSync(absolute, { force: true })
+    }
+  }
+}
+
+function writeBlob(blobsDirectory: string, bytes: Uint8Array): string {
+  const hash = createHash('sha1').update(Buffer.from(bytes)).digest('hex')
+  const blobFile = path.join(blobsDirectory, `${hash}.bin`)
+  if (!fs.existsSync(blobFile)) {
+    fs.writeFileSync(blobFile, Buffer.from(bytes))
+  }
+  return blobFile
+}
+
+function hashFile(fileName: string): string {
+  return createHash('sha1').update(fs.readFileSync(fileName)).digest('hex')
+}
+
+function computeIncrementalContextHash(
+  options: ProjectOptions,
+  config: ts.ParsedCommandLine,
+  tsconfigFileName?: string
+): string {
+  const lockfiles = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'].map(
+    file => hashFileOrEmpty(path.join(options.cwd, file))
+  )
+  const payload = {
+    schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+    scipVersion: packageJson.version,
+    typescriptVersion: ts.version,
+    projectRoot: path.resolve(options.projectRoot),
+    maxFileByteSizeNumber: options.maxFileByteSizeNumber,
+    compilerOptions: stableJson(config.options),
+    tsconfigHash: tsconfigFileName ? hashFileOrEmpty(tsconfigFileName) : '',
+    cwdPackageHash: hashFileOrEmpty(path.join(options.cwd, 'package.json')),
+    projectPackageHash: hashFileOrEmpty(
+      path.join(options.projectRoot, 'package.json')
+    ),
+    lockfiles,
+  }
+  return createHash('sha1').update(JSON.stringify(payload)).digest('hex')
+}
+
+function hashFileOrEmpty(fileName: string): string {
+  if (!fs.existsSync(fileName)) {
+    return ''
+  }
+  return hashFile(fileName)
+}
+
+function stableJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(item => stableJson(item))
+  }
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'function' || value === undefined) {
+      return undefined
+    }
+    return value
+  }
+  const object = value as Record<string, unknown>
+  const result: Record<string, unknown> = {}
+  for (const key of Object.keys(object).sort()) {
+    const normalized = stableJson(object[key])
+    if (normalized !== undefined) {
+      result[key] = normalized
+    }
+  }
+  return result
 }
 
 if (require.main === module) {

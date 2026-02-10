@@ -73,6 +73,7 @@ export class ProjectIndexer {
   private symbolCache: Map<ts.Node, ScipSymbol> = new Map()
   private hasConstructor: Map<ts.ClassDeclaration, boolean> = new Map()
   private packages: Packages
+  private indexableSourceFiles: ts.SourceFile[] | undefined
   constructor(
     public readonly config: ts.ParsedCommandLine,
     public readonly options: ProjectOptions,
@@ -83,24 +84,53 @@ export class ProjectIndexer {
     this.checker = this.program.getTypeChecker()
     this.packages = new Packages(options.projectRoot)
   }
-  public index(): void {
-    const startTimestamp = Date.now()
-    const sourceFiles = this.program.getSourceFiles()
+  public getIndexableFileNames(): string[] {
+    return this.getIndexableSourceFiles().map(sourceFile => sourceFile.fileName)
+  }
 
-    const filesToIndex: ts.SourceFile[] = []
-    // Visit every sourceFile in the program
+  public computeDependents(): Map<string, Set<string>> {
+    const dependents = new Map<string, Set<string>>()
+    const sourceFiles = this.getIndexableSourceFiles()
+    const fileSet = new Set(sourceFiles.map(sourceFile => sourceFile.fileName))
+
     for (const sourceFile of sourceFiles) {
-      const includes = this.config.fileNames.includes(sourceFile.fileName)
-      if (!includes) {
-        continue
+      const dependencies = resolveDependencies(
+        sourceFile,
+        this.config.options,
+        fileSet
+      )
+      for (const dependency of dependencies) {
+        let current = dependents.get(dependency)
+        if (!current) {
+          current = new Set()
+          dependents.set(dependency, current)
+        }
+        current.add(sourceFile.fileName)
       }
-      filesToIndex.push(sourceFile)
     }
 
-    if (filesToIndex.length === 0) {
+    return dependents
+  }
+
+  public index(
+    onlyFiles?: Set<string>,
+    onDocument?: (fileName: string, indexBytes: Uint8Array) => void
+  ): Set<string> {
+    const startTimestamp = Date.now()
+    const filesToIndex: ts.SourceFile[] = []
+    for (const sourceFile of this.getIndexableSourceFiles()) {
+      if (!onlyFiles || onlyFiles.has(sourceFile.fileName)) {
+        filesToIndex.push(sourceFile)
+      }
+    }
+
+    if (this.getIndexableSourceFiles().length === 0) {
       throw new Error(
         `no indexable files in project '${this.options.projectDisplayName}'`
       )
+    }
+    if (filesToIndex.length === 0) {
+      return new Set()
     }
 
     const jobs: ProgressBar | undefined = this.options.progressBar
@@ -118,6 +148,7 @@ export class ProjectIndexer {
         )
       : undefined
     let lastWrite = startTimestamp
+    const emittedFiles = new Set<string>()
     for (const [index, sourceFile] of filesToIndex.entries()) {
       const title = path.relative(this.options.cwd, sourceFile.fileName)
       jobs?.tick({ title })
@@ -153,11 +184,15 @@ export class ProjectIndexer {
         )
       }
       if (visitor.document.occurrences.length > 0) {
-        this.options.writeIndex(
-          new scip.scip.Index({
-            documents: [visitor.document],
-          })
-        )
+        const indexMessage = new scip.scip.Index({
+          documents: [visitor.document],
+        })
+        if (onDocument) {
+          onDocument(sourceFile.fileName, indexMessage.serializeBinary())
+        } else {
+          this.options.writeIndex(indexMessage)
+        }
+        emittedFiles.add(sourceFile.fileName)
       }
     }
     jobs?.terminate()
@@ -168,6 +203,22 @@ export class ProjectIndexer {
     console.log(
       `+ ${this.options.projectDisplayName} (${prettyMilliseconds(elapsed)})`
     )
+    return emittedFiles
+  }
+
+  private getIndexableSourceFiles(): ts.SourceFile[] {
+    if (this.indexableSourceFiles) {
+      return this.indexableSourceFiles
+    }
+    const sourceFiles = this.program.getSourceFiles()
+    const filesToIndex: ts.SourceFile[] = []
+    for (const sourceFile of sourceFiles) {
+      if (this.config.fileNames.includes(sourceFile.fileName)) {
+        filesToIndex.push(sourceFile)
+      }
+    }
+    this.indexableSourceFiles = filesToIndex
+    return filesToIndex
   }
 }
 
@@ -210,4 +261,66 @@ function isSameLanguageVersion(
     // if we compare setExternalModuleIndicator since it's function with a
     // unique reference on every `CompilerHost.getSourceFile` callback.
   )
+}
+
+function resolveDependencies(
+  sourceFile: ts.SourceFile,
+  compilerOptions: ts.CompilerOptions,
+  fileSet: Set<string>
+): Set<string> {
+  const dependencies = new Set<string>()
+  const preprocessed = ts.preProcessFile(sourceFile.getFullText())
+  for (const reference of preprocessed.referencedFiles) {
+    const resolved = path.resolve(path.dirname(sourceFile.fileName), reference.fileName)
+    if (fileSet.has(resolved)) {
+      dependencies.add(resolved)
+    }
+  }
+  const modules = collectModuleSpecifiers(sourceFile)
+  for (const moduleName of modules) {
+    const resolution = ts.resolveModuleName(
+      moduleName,
+      sourceFile.fileName,
+      compilerOptions,
+      ts.sys
+    ).resolvedModule
+    if (!resolution) {
+      continue
+    }
+    const resolvedFileName = path.resolve(resolution.resolvedFileName)
+    if (fileSet.has(resolvedFileName)) {
+      dependencies.add(resolvedFileName)
+    }
+  }
+  return dependencies
+}
+
+function collectModuleSpecifiers(sourceFile: ts.SourceFile): string[] {
+  const modules: string[] = []
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+      node.moduleSpecifier &&
+      ts.isStringLiteral(node.moduleSpecifier)
+    ) {
+      modules.push(node.moduleSpecifier.text)
+    } else if (
+      ts.isImportEqualsDeclaration(node) &&
+      ts.isExternalModuleReference(node.moduleReference) &&
+      node.moduleReference.expression &&
+      ts.isStringLiteral(node.moduleReference.expression)
+    ) {
+      modules.push(node.moduleReference.expression.text)
+    } else if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+      node.arguments.length === 1 &&
+      ts.isStringLiteral(node.arguments[0])
+    ) {
+      modules.push(node.arguments[0].text)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return modules
 }

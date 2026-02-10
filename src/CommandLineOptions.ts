@@ -14,6 +14,8 @@ export interface MultiProjectOptions {
   yarnBerryWorkspaces: boolean
   pnpmWorkspaces: boolean
   globalCaches: boolean
+  incremental: boolean
+  incrementalRoot?: string
   maxFileByteSize?: string
   maxFileByteSizeNumber?: number
   cwd: string
@@ -68,6 +70,11 @@ export function mainCommand(
     .option(
       '--no-global-caches',
       'whether to disable global caches between TypeScript projects'
+    )
+    .option(
+      '--incremental',
+      'whether to persist and reuse per-file index state between runs',
+      false
     )
     .option(
       '--max-file-byte-size <value>',
