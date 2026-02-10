@@ -164,4 +164,40 @@ test('incremental indexing reindexes dependents of changed files', () => {
   }
 })
 
+test('incremental indexing indexes new files without reindexing unchanged files', () => {
+  const fixture = makeTempProjectFromFixture()
+  try {
+    runIncrementalIndex(fixture.root, fixture.output)
+    const firstManifest = readManifest(fixture.output)
+    const [firstAPath, firstAState] = findFileState(
+      firstManifest,
+      path.join('src', 'a.ts')
+    )
+    const [firstBPath, firstBState] = findFileState(
+      firstManifest,
+      path.join('src', 'b.ts')
+    )
+
+    fs.writeFileSync(
+      path.join(fixture.root, 'src', 'c.ts'),
+      "import { value, SharedType } from './a'\nexport const plusTwo: SharedType = value + 2\n"
+    )
+    runIncrementalIndex(fixture.root, fixture.output)
+
+    const secondManifest = readManifest(fixture.output)
+    const secondAState = secondManifest.files[firstAPath]
+    const secondBState = secondManifest.files[firstBPath]
+    const [, secondCState] = findFileState(secondManifest, path.join('src', 'c.ts'))
+
+    assert.ok(secondAState !== undefined)
+    assert.ok(secondBState !== undefined)
+    assert.ok(secondCState !== undefined)
+    assert.equal(secondAState.blob, firstAState.blob)
+    assert.equal(secondBState.blob, firstBState.blob)
+    assert.ok(secondCState.blob.length > 0)
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  }
+})
+
 test.run()
